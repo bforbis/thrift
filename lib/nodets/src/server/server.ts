@@ -68,7 +68,7 @@ export function createMultiplexServer<
       ? options.protocol
       : ((TBinaryProtocol as unknown) as TProtocolClass<TProtocol>);
 
-  function serverImpl(stream: net.Socket): void {
+  const serverImpl = function(this: net.Server, stream: net.Socket): void {
     const self = this;
     stream.on('error', function(err) {
       self.emit('error', err);
@@ -78,7 +78,7 @@ export function createMultiplexServer<
       transport.receiver(function(transportWithData: TTransport) {
         const input = new protocol(transportWithData);
         const output = new protocol(
-          new transport(undefined, function(buf) {
+          new transport(undefined, function(buf: Buffer) {
             try {
               stream.write(buf);
             } catch (err) {
@@ -121,7 +121,7 @@ export function createMultiplexServer<
     stream.on('end', function() {
       stream.end();
     });
-  }
+  };
 
   if (options && options.tls) {
     if (
