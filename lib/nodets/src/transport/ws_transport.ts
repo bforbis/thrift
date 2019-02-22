@@ -18,19 +18,24 @@
  */
 
 import * as log from '../util/log';
-import * as WebSocket from 'ws';
+import WebSocket = require('ws');
+
+interface BufferCallback {
+  buf: string;
+  cb: Function;
+}
 
 export default class TWebSocketTransport {
-  public url: string; //Where to connect
-  public socket: null | WebSocket; //The web socket
-  private callbacks: Function[]; //Pending callbacks
-  private send_pending: any[]; //Buffers/Callback pairs waiting to be sent
-  private send_buf: string; //Outbound data, immutable until sent
-  private recv_buf: string; //Inbound data
-  private rb_wpos: number; //Network write position in receive buffer
-  private rb_rpos: number; //Client read position in receive buffer
-  private wpos: number; // Write position
-  private rpos: number; // Read position
+  public url = ''; //Where to connect
+  public socket: null | WebSocket = null; //The web socket
+  private callbacks: Function[] = []; //Pending callbacks
+  private send_pending: BufferCallback[] = []; //Buffers/Callback pairs waiting to be sent
+  private send_buf: string = ''; //Outbound data, immutable until sent
+  private recv_buf: string = ''; //Inbound data
+  private rb_wpos: number = 0; //Network write position in receive buffer
+  private rb_rpos: number = 0; //Client read position in receive buffer
+  private wpos: number = 0; // Write position
+  private rpos: number = 0; // Read position
 
   /**
    * Constructor Function for the WebSocket transport.
@@ -70,7 +75,7 @@ export default class TWebSocketTransport {
    */
   public flush(async: any, callback: Function): void {
     const self = this;
-    if (this.isOpen()) {
+    if (this.isOpen() && this.socket) {
       //Send data and register a callback to invoke the client callback
       this.socket.send(this.send_buf);
       this.callbacks.push(
@@ -93,38 +98,40 @@ export default class TWebSocketTransport {
 
   private __onOpen(): void {
     const self = this;
-    if (this.send_pending.length > 0) {
+    this.send_pending.forEach(elem => {
       //If the user made calls before the connection was fully
       //open, send them now
-      this.send_pending.forEach(function(elem) {
+      if (this.socket) {
         this.socket.send(elem.buf);
-        this.callbacks.push(
-          (function() {
-            const clientCallback = elem.cb;
-            return function(msg: string) {
-              self.setRecvBuffer(msg);
-              clientCallback();
-            };
-          })()
-        );
-      });
-      this.send_pending = [];
-    }
+      }
+
+      this.callbacks.push(
+        (function() {
+          const clientCallback = elem.cb;
+          return function(msg: string) {
+            self.setRecvBuffer(msg);
+            clientCallback();
+          };
+        })()
+      );
+    });
+    this.send_pending = [];
   }
 
-  private __onClose(evt): void {
+  private __onClose(): void {
     this.__reset(this.url);
   }
 
-  private __onMessage(evt): void {
-    if (this.callbacks.length) {
-      this.callbacks.shift()(evt.data);
+  private __onMessage(evt: { data: WebSocket.Data }): void {
+    const callback = this.callbacks.shift();
+    if (callback) {
+      callback(evt.data);
     }
   }
 
-  private __onError(evt): void {
+  private __onError(evt: { error: any; message: string }): void {
     log.error('websocket: ' + evt.toString());
-    this.socket.close();
+    this.close();
   }
 
   /**
@@ -155,7 +162,8 @@ export default class TWebSocketTransport {
       return;
     }
     //If there is no socket or the socket is closed:
-    this.socket = new WebSocket(this.url);
+    const url = this.url;
+    this.socket = new WebSocket(url);
     this.socket.onopen = this.__onOpen.bind(this);
     this.socket.onmessage = this.__onMessage.bind(this);
     this.socket.onerror = this.__onError.bind(this);
@@ -166,7 +174,9 @@ export default class TWebSocketTransport {
    * Closes the transport connection
    */
   public close(): void {
-    this.socket.close();
+    if (this.socket) {
+      this.socket.close();
+    }
   }
 
   /**
