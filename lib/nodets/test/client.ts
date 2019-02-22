@@ -46,8 +46,8 @@ var testDriver = promise ? ThriftTestDriverPromise : ThriftTestDriver;
 
 var connection = thrift.createConnection("localhost", port, options);
 
-connection.on("error", function(err: string) {
-    assert(false, err);
+connection.on("error", function (err: string) {
+  assert(false, err);
 });
 
 var client = thrift.createClient(ThriftTest.Client, connection);
@@ -60,4 +60,4 @@ function runTests() {
   });
 }
 
-exports.expressoTest = function() {};
+exports.expressoTest = function () { };

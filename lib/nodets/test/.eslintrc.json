@@ -1,0 +1,15 @@
+{
+  "extends": [
+    "../../../.eslintrc.json",
+    "plugin:@typescript-eslint/recommended",
+    "plugin:prettier/recommended",
+    "prettier/@typescript-eslint"
+  ],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "project": "./lib/nodets/test/tsconfig.json"
+  },
+  "plugins": [
+    "@typescript-eslint"
+  ]
+}

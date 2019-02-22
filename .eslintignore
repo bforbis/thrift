@@ -1,7 +1,21 @@
-# TODO: Use eslint on js lib and generated code
+# TODO:
+# This file really ought to be moved down a few levels along with package.json
+# Keeping these at the root level causes any recursive testing utility to be really
+# slow. Ideally this lives in the javascript lib directories, but currently there
+# are 4 of them...
 
+# Add a bunch of ignores to make eslint faster
+aclocal/**
+lib/{as3,c_glib,cl,cpp,csharp,d,dart,delphi,erl,go,haxe,hs,java,javame,json,lua,netcore,netstd,ocaml,perl,php,py,rb,rs,st,swift,xml}/**
+build/**
+compiler/**
+contrib/**
+debian/**
+
+# TODO: Use eslint on js lib and generated code
 # Ignore lib/js for now, which uses jshint currently
 lib/js/*
+
 # Ignore all generated code for now
 **/gen-*
 
