@@ -102,8 +102,6 @@ export default abstract class TAbstractProtocol {
   public skip(type: Thrift.Type): void {
     let mapBegin: Thrift.TMap, setBegin: Thrift.TSet, listBegin: Thrift.TList;
     switch (type) {
-      case Thrift.Type.STOP:
-        return;
       case Thrift.Type.BOOL:
         this.readBool();
         break;
