@@ -124,14 +124,21 @@ export interface ServiceClient {
   _reqs: {
     [keyid: number]: (error: any, result: any) => void;
   };
+
+  [key: string]: any;
 }
+
+export interface MultiplexedServiceClient {
+  [key: string]: ServiceClient;
+}
+
 export interface ServiceProcessor {
   process(input: TAbstractProtocol, output: TAbstractProtocol): void;
 }
 
 export interface TConnection {
   write(buf: Buffer, seqid: number): void;
-  client?: ServiceClient;
+  client?: ServiceClient | MultiplexedServiceClient;
   transport: StaticClass<TAbstractTransport>;
   protocol: StaticClass<TAbstractProtocol>;
 }

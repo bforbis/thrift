@@ -40,7 +40,11 @@ import {
   TApplicationExceptionType
 } from '../exception';
 import * as log from '../util/log';
-import { ServiceClient, TConnection } from '../thrift';
+import {
+  ServiceClient,
+  TConnection,
+  MultiplexedServiceClient
+} from '../thrift';
 
 export { default as createClient } from './create_client';
 export { default as createStdIOClient } from './create_client';
@@ -64,8 +68,8 @@ export class Connection<
 > extends EventEmitter implements TConnection {
   public seqId2Service: { [key: number]: string } = {};
   public connection: net.Socket | tls.TLSSocket;
-  public host?: string;
-  public port?: number;
+  public host: string = '';
+  public port: number = -1;
   public path?: string;
   public ssl: boolean;
   public options: ConnectionOptions<TTransport, TProtocol>;
@@ -79,7 +83,9 @@ export class Connection<
   public connect_timeout: boolean | number = false;
 
   // Set in create_client.ts
-  public client?: ServiceClient;
+  // Either a single client, or multiplexed client which maps
+  // service name to client implementation
+  public client?: ServiceClient | MultiplexedServiceClient;
 
   // Retry attributes
   public retry_timer: null | NodeJS.Timeout = null;
@@ -137,14 +143,11 @@ export class Connection<
 
     this.connection.addListener(
       this.ssl ? 'secureConnect' : 'connect',
-      function() {
+      function(this: net.Socket | tls.TLSSocket) {
         self.connected = true;
 
         this.setTimeout(self.options.timeout || 0);
         this.setNoDelay();
-        this.frameLeft = 0;
-        this.framePos = 0;
-        this.frame = null;
         self.initialize_retry_vars();
 
         self.offline_queue.forEach(function(data) {
@@ -184,52 +187,58 @@ export class Connection<
           while (true) {
             const header = message.readMessageBegin();
             const dummy_seqid = header.rseqid * -1;
-            let client = self.client;
-            //The Multiplexed Protocol stores a hash of seqid to service names
-            //  in seqId2Service. If the SeqId is found in the hash we need to
-            //  lookup the appropriate client for this call.
-            //  The connection.client object is a single client object when not
-            //  multiplexing, when using multiplexing it is a service name keyed
-            //  hash of client objects.
-            //NOTE: The 2 way interdependencies between protocols, transports,
-            //  connections and clients in the Node.js implementation are irregular
-            //  and make the implementation difficult to extend and maintain. We
-            //  should bring this stuff inline with typical thrift I/O stack
-            //  operation soon.
-            //  --ra
-            const service_name = self.seqId2Service[header.rseqid];
-            if (service_name) {
-              client = self.client[service_name];
-            }
-
-            client._reqs[dummy_seqid] = function(err, success) {
-              transport_with_data.commitPosition();
-
-              const callback = client._reqs[header.rseqid];
-              delete client._reqs[header.rseqid];
+            if (self.client) {
+              let client: ServiceClient;
+              //The Multiplexed Protocol stores a hash of seqid to service names
+              //  in seqId2Service. If the SeqId is found in the hash we need to
+              //  lookup the appropriate client for this call.
+              //  The connection.client object is a single client object when not
+              //  multiplexing, when using multiplexing it is a service name keyed
+              //  hash of client objects.
+              //NOTE: The 2 way interdependencies between protocols, transports,
+              //  connections and clients in the Node.js implementation are irregular
+              //  and make the implementation difficult to extend and maintain. We
+              //  should bring this stuff inline with typical thrift I/O stack
+              //  operation soon.
+              //  --ra
+              const service_name = self.seqId2Service[header.rseqid];
               if (service_name) {
-                delete self.seqId2Service[header.rseqid];
+                client = (self.client as MultiplexedServiceClient)[
+                  service_name
+                ];
+              } else {
+                client = self.client as ServiceClient;
               }
-              if (callback) {
-                callback(err, success);
-              }
-            };
 
-            if (client['recv_' + header.fname]) {
-              client['recv_' + header.fname](
-                message,
-                header.mtype,
-                dummy_seqid
-              );
-            } else {
-              delete client._reqs[dummy_seqid];
-              self.emit(
-                'error',
-                new TApplicationException(
-                  TApplicationExceptionType.WRONG_METHOD_NAME,
-                  'Received a response to an unknown RPC function'
-                )
-              );
+              client._reqs[dummy_seqid] = function(err, success) {
+                transport_with_data.commitPosition();
+
+                const callback = client._reqs[header.rseqid];
+                delete client._reqs[header.rseqid];
+                if (service_name) {
+                  delete self.seqId2Service[header.rseqid];
+                }
+                if (callback) {
+                  callback(err, success);
+                }
+              };
+
+              if (client['recv_' + header.fname]) {
+                client['recv_' + header.fname](
+                  message,
+                  header.mtype,
+                  dummy_seqid
+                );
+              } else {
+                delete client._reqs[dummy_seqid];
+                self.emit(
+                  'error',
+                  new TApplicationException(
+                    TApplicationExceptionType.WRONG_METHOD_NAME,
+                    'Received a response to an unknown RPC function'
+                  )
+                );
+              }
             }
           }
         } catch (e) {
@@ -379,7 +388,7 @@ export function createSSLConnection<
 >(
   host: string,
   port: number,
-  options?: ConnectionOptions<TTransport, TProtocol>
+  options: ConnectionOptions<TTransport, TProtocol> = {}
 ): Connection<TTransport, TProtocol> {
   if (!('secureProtocol' in options) && !('secureOptions' in options)) {
     options.secureProtocol = 'SSLv23_method';
@@ -477,16 +486,18 @@ export class StdIOConnection<
           const header = message.readMessageBegin();
           const dummy_seqid = header.rseqid * -1;
           const client = self.client;
-          client._reqs[dummy_seqid] = function(err, success) {
-            transport_with_data.commitPosition();
+          if (client) {
+            client._reqs[dummy_seqid] = function(err, success) {
+              transport_with_data.commitPosition();
 
-            const callback = client._reqs[header.rseqid];
-            delete client._reqs[header.rseqid];
-            if (callback) {
-              callback(err, success);
-            }
-          };
-          client['recv_' + header.fname](message, header.mtype, dummy_seqid);
+              const callback = client._reqs[header.rseqid];
+              delete client._reqs[header.rseqid];
+              if (callback) {
+                callback(err, success);
+              }
+            };
+            client['recv_' + header.fname](message, header.mtype, dummy_seqid);
+          }
         } catch (e) {
           if (e instanceof InputBufferUnderrunError) {
             transport_with_data.rollbackPosition();
