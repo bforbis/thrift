@@ -16,20 +16,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-const http = require('http');
-const https = require('https');
-const url = require('url');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
-const log = require('./log');
+import * as http from 'http';
+import * as https from 'https';
+import * as url from 'url';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
+import * as log from '../util/log';
 
-const MultiplexedProcessor = require('./multiplexed_processor')
-  .MultiplexedProcessor;
+import { MultiplexedProcessor } from './multiplexed_processor';
+import {
+  TBufferedTransport,
+  TAbstractTransport,
+  TTransportClass
+} from '../transport';
+import { TBinaryProtocol, TAbstractProtocol } from '../protocol';
+import { InputBufferUnderrunError } from '../exception';
 
-const TBufferedTransport = require('./buffered_transport');
-const TBinaryProtocol = require('./binary_protocol');
-const InputBufferUnderrunError = require('./exceptions/input_buffer_underrun_error');
+import { StaticClass, ServiceProcessor } from '../thrift';
 
 // WSFrame constructor and prototype
 /////////////////////////////////////////////////////////////////////
@@ -75,33 +79,50 @@ const InputBufferUnderrunError = require('./exceptions/input_buffer_underrun_err
  *    |                     Payload Data continued ...                |
  *    +---------------------------------------------------------------+
  */
-var wsFrame = {
-  /** Encodes a WebSocket frame
-   *
-   * @param {Buffer} data - The raw data to encode
-   * @param {Buffer} mask - The mask to apply when sending to server, null for no mask
-   * @param {Boolean} binEncoding - True for binary encoding, false for text encoding
-   * @returns {Buffer} - The WebSocket frame, ready to send
-   */
-  encode: function(data, mask, binEncoding) {
-    const frame = new Buffer(wsFrame.frameSizeFromData(data, mask));
+
+abstract class WSFrame {
+  public static frameOpCodes = {
+    CONT: 0x00,
+    TEXT: 0x01,
+    BIN: 0x02,
+    CTRL: 0x80,
+    // Find out what this should be
+    FINCTRL: undefined
+  };
+
+  public static mask = {
+    TO_SERVER: 0x80,
+    TO_CLIENT: 0x00
+  };
+
+  public static fin = {
+    CONT: 0x00,
+    FIN: 0x80
+  };
+
+  public static encode(
+    data: Buffer,
+    mask: Buffer | null,
+    binEncoding: boolean
+  ): Buffer {
+    const frame = new Buffer(WSFrame.frameSizeFromData(data, mask));
     //Byte 0 - FIN & OPCODE
     frame[0] =
-      wsFrame.fin.FIN +
-      (binEncoding ? wsFrame.frameOpCodes.BIN : wsFrame.frameOpCodes.TEXT);
+      WSFrame.fin.FIN +
+      (binEncoding ? WSFrame.frameOpCodes.BIN : WSFrame.frameOpCodes.TEXT);
     //Byte 1 or 1-3 or 1-9 - MASK FLAG & SIZE
     let payloadOffset = 2;
     if (data.length < 0x7e) {
       frame[1] =
-        data.length + (mask ? wsFrame.mask.TO_SERVER : wsFrame.mask.TO_CLIENT);
+        data.length + (mask ? WSFrame.mask.TO_SERVER : WSFrame.mask.TO_CLIENT);
     } else if (data.length < 0xffff) {
       frame[1] =
-        0x7e + (mask ? wsFrame.mask.TO_SERVER : wsFrame.mask.TO_CLIENT);
+        0x7e + (mask ? WSFrame.mask.TO_SERVER : WSFrame.mask.TO_CLIENT);
       frame.writeUInt16BE(data.length, 2, true);
       payloadOffset = 4;
     } else {
       frame[1] =
-        0x7f + (mask ? wsFrame.mask.TO_SERVER : wsFrame.mask.TO_CLIENT);
+        0x7f + (mask ? WSFrame.mask.TO_SERVER : WSFrame.mask.TO_CLIENT);
       frame.writeUInt32BE(0, 2, true);
       frame.writeUInt32BE(data.length, 6, true);
       payloadOffset = 10;
@@ -114,26 +135,13 @@ var wsFrame = {
     //Payload
     data.copy(frame, payloadOffset);
     if (mask) {
-      wsFrame.applyMask(
+      WSFrame.applyMask(
         frame.slice(payloadOffset),
         frame.slice(payloadOffset - 4, payloadOffset)
       );
     }
     return frame;
-  },
-
-  /**
-   * @class
-   * @name WSDecodeResult
-   * @property {Buffer} data - The decoded data for the first ATRPC message
-   * @property {Buffer} mask - The frame mask
-   * @property {Boolean} binEncoding - True if binary (TBinaryProtocol),
-   *                                   False if text (TJSONProtocol)
-   * @property {Buffer} nextFrame - Multiple ATRPC messages may be sent in a
-   *                                single WebSocket frame, this Buffer contains
-   *                                any bytes remaining to be decoded
-   * @property {Boolean} FIN - True is the message is complete
-   */
+  }
 
   /** Decodes a WebSocket frame
    *
@@ -143,8 +151,8 @@ var wsFrame = {
    *
    * @see {@link WSDecodeResult}
    */
-  decode: function(frame) {
-    const result = {
+  public static decode(frame: Buffer): WSDecodeResult {
+    const result: WSDecodeResult = {
       data: null,
       mask: null,
       binEncoding: false,
@@ -153,11 +161,11 @@ var wsFrame = {
     };
 
     //Byte 0 - FIN & OPCODE
-    if (wsFrame.fin.FIN != (frame[0] & wsFrame.fin.FIN)) {
+    if (WSFrame.fin.FIN != (frame[0] & WSFrame.fin.FIN)) {
       result.FIN = false;
     }
     result.binEncoding =
-      wsFrame.frameOpCodes.BIN == (frame[0] & wsFrame.frameOpCodes.BIN);
+      WSFrame.frameOpCodes.BIN == (frame[0] & WSFrame.frameOpCodes.BIN);
     //Byte 1 or 1-3 or 1-9 - SIZE
     const lenByte = frame[1] & 0x0000007f;
     let len = lenByte;
@@ -170,7 +178,7 @@ var wsFrame = {
       dataOffset = 10;
     }
     //MASK
-    if (wsFrame.mask.TO_SERVER == (frame[1] & wsFrame.mask.TO_SERVER)) {
+    if (WSFrame.mask.TO_SERVER == (frame[1] & WSFrame.mask.TO_SERVER)) {
       result.mask = new Buffer(4);
       frame.copy(result.mask, 0, dataOffset, dataOffset + 4);
       dataOffset += 4;
@@ -179,7 +187,7 @@ var wsFrame = {
     result.data = new Buffer(len);
     frame.copy(result.data, 0, dataOffset, dataOffset + len);
     if (result.mask) {
-      wsFrame.applyMask(result.data, result.mask);
+      WSFrame.applyMask(result.data, result.mask);
     }
     //Next Frame
     if (frame.length > dataOffset + len) {
@@ -187,33 +195,34 @@ var wsFrame = {
       frame.copy(result.nextFrame, 0, dataOffset + len, frame.length);
     }
     //Don't forward control frames
-    if (frame[0] & wsFrame.frameOpCodes.FINCTRL) {
+    // @ts-ignore - TODO: Figure out what FINCTRL should be set to
+    if (frame[0] & WSFrame.frameOpCodes.FINCTRL) {
       result.data = null;
     }
 
     return result;
-  },
+  }
 
   /** Masks/Unmasks data
    *
    * @param {Buffer} data - data to mask/unmask in place
    * @param {Buffer} mask - the mask
    */
-  applyMask: function(data, mask) {
+  public static applyMask(data: Buffer, mask: Buffer): void {
     //TODO: look into xoring words at a time
     const dataLen = data.length;
     const maskLen = mask.length;
     for (let i = 0; i < dataLen; i++) {
       data[i] = data[i] ^ mask[i % maskLen];
     }
-  },
+  }
 
   /** Computes frame size on the wire from data to be sent
    *
    * @param {Buffer} data - data.length is the assumed payload size
    * @param {Boolean} mask - true if a mask will be sent (TO_SERVER)
    */
-  frameSizeFromData: function(data, mask) {
+  public static frameSizeFromData(data: Buffer, mask: Buffer | null): number {
     let headerSize = 10;
     if (data.length < 0x7e) {
       headerSize = 2;
@@ -221,25 +230,28 @@ var wsFrame = {
       headerSize = 4;
     }
     return headerSize + data.length + (mask ? 4 : 0);
-  },
-
-  frameOpCodes: {
-    CONT: 0x00,
-    TEXT: 0x01,
-    BIN: 0x02,
-    CTRL: 0x80
-  },
-
-  mask: {
-    TO_SERVER: 0x80,
-    TO_CLIENT: 0x00
-  },
-
-  fin: {
-    CONT: 0x00,
-    FIN: 0x80
   }
-};
+}
+
+/**
+ * @interface
+ * @name WSDecodeResult
+ * @property {Buffer} data - The decoded data for the first ATRPC message
+ * @property {Buffer} mask - The frame mask
+ * @property {Boolean} binEncoding - True if binary (TBinaryProtocol),
+ *                                   False if text (TJSONProtocol)
+ * @property {Buffer} nextFrame - Multiple ATRPC messages may be sent in a
+ *                                single WebSocket frame, this Buffer contains
+ *                                any bytes remaining to be decoded
+ * @property {Boolean} FIN - True is the message is complete
+ */
+interface WSDecodeResult {
+  data: Buffer | null;
+  mask: Buffer | null;
+  binEncoding: boolean;
+  nextFrame: Buffer | null;
+  FIN: boolean;
+}
 
 // createWebServer constructor and options
 /////////////////////////////////////////////////////////////////////
@@ -260,6 +272,27 @@ var wsFrame = {
  *                          at least a key and a cert must be defined to use SSL/TLS
  * @see {@link ServiceOptions}
  */
+interface ServerOptions {
+  cors?: {
+    [key: string]: boolean;
+  };
+  files: string;
+  headers?: http.OutgoingHttpHeaders;
+  services: {
+    [key: string]: ServiceObject;
+  };
+  tls?: https.ServerOptions;
+}
+
+interface ServiceObject {
+  processor: any;
+  cls?: any;
+  handler?: { [key: string]: Function };
+  transport: TTransportClass<TAbstractTransport>;
+  protocol: StaticClass<TAbstractProtocol>;
+}
+
+type ProcessorConstructor = StaticClass<ServiceProcessor>;
 
 /**
  * @class
@@ -280,9 +313,11 @@ var wsFrame = {
  * @param {ServerOptions} options - The server configuration.
  * @returns {object} - The Apache Thrift Web Server.
  */
-exports.createWebServer = function(options) {
+export function createWebServer(
+  options: ServerOptions
+): http.Server | https.Server {
   const baseDir = options.files;
-  const contentTypesByExtension = {
+  const contentTypesByExtension: { [key: string]: string } = {
     '.txt': 'text/plain',
     '.html': 'text/html',
     '.css': 'text/css',
@@ -302,15 +337,14 @@ exports.createWebServer = function(options) {
     const svcObj = services[uri];
 
     //Setup the processor
-    if (svcObj.processor instanceof MultiplexedProcessor) {
-      //Multiplex processors have pre embedded processor/handler pairs, save as is
-      svcObj.processor = svcObj.processor;
-    } else {
+    //Multiplex processors have pre embedded processor/handler pairs, save as is
+    if (!(svcObj.processor instanceof MultiplexedProcessor)) {
       //For historical reasons Node.js supports processors passed in directly or via the
       //  IDL Compiler generated class housing the processor. Also, the options property
       //  for a Processor has been called both cls and processor at different times. We
       //  support any of the four possibilities here.
-      const processor = svcObj.processor
+
+      const processor: ProcessorConstructor = svcObj.processor
         ? svcObj.processor.Processor || svcObj.processor
         : svcObj.cls.Processor || svcObj.cls;
       //Processors can be supplied as constructed objects with handlers already embedded,
@@ -327,9 +361,12 @@ exports.createWebServer = function(options) {
   }
 
   //Verify CORS requirements
-  function VerifyCORSAndSetHeaders(request, response) {
+  function VerifyCORSAndSetHeaders(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): boolean {
     if (request.headers.origin && options.cors) {
-      if (options.cors['*'] || options.cors[request.headers.origin]) {
+      if (options.cors['*'] || options.cors[request.headers.origin as string]) {
         //Allow, origin allowed
         response.setHeader(
           'access-control-allow-origin',
@@ -356,12 +393,15 @@ exports.createWebServer = function(options) {
 
   //Handle OPTIONS method (CORS)
   ///////////////////////////////////////////////////
-  function processOptions(request, response) {
+  function processOptions(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): void {
     if (VerifyCORSAndSetHeaders(request, response)) {
-      response.writeHead('204', 'No Content', { 'content-length': 0 });
+      response.writeHead(204, 'No Content', { 'content-length': 0 });
     } else {
       response.writeHead(
-        '403',
+        403,
         'Origin ' + request.headers.origin + ' not allowed',
         {}
       );
@@ -371,62 +411,70 @@ exports.createWebServer = function(options) {
 
   //Handle POST methods (TXHRTransport)
   ///////////////////////////////////////////////////
-  function processPost(request, response) {
+  function processPost(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): void {
     //Lookup service
-    const uri = url.parse(request.url).pathname;
-    const svc = services[uri];
-    if (!svc) {
-      response.writeHead('403', 'No Apache Thrift Service at ' + uri, {});
-      response.end();
-      return;
-    }
+    if (request.url) {
+      const uri = url.parse(request.url).pathname;
+      const svc = services[uri || ''];
+      if (!svc) {
+        response.writeHead(403, 'No Apache Thrift Service at ' + uri, {});
+        response.end();
+        return;
+      }
 
-    //Verify CORS requirements
-    if (!VerifyCORSAndSetHeaders(request, response)) {
-      response.writeHead(
-        '403',
-        'Origin ' + request.headers.origin + ' not allowed',
-        {}
-      );
-      response.end();
-      return;
-    }
+      //Verify CORS requirements
+      if (!VerifyCORSAndSetHeaders(request, response)) {
+        response.writeHead(
+          403,
+          'Origin ' + request.headers.origin + ' not allowed',
+          {}
+        );
+        response.end();
+        return;
+      }
 
-    //Process XHR payload
-    request.on(
-      'data',
-      svc.transport.receiver(function(transportWithData) {
-        const input = new svc.protocol(transportWithData);
-        const output = new svc.protocol(
-          new svc.transport(undefined, function(buf) {
-            try {
-              response.writeHead(200);
-              response.end(buf);
-            } catch (err) {
+      //Process XHR payload
+      request.on(
+        'data',
+        svc.transport.receiver(function(transportWithData: TAbstractTransport) {
+          const input = new svc.protocol(transportWithData);
+          const output = new svc.protocol(
+            new svc.transport(undefined, function(buf: Buffer) {
+              try {
+                response.writeHead(200);
+                response.end(buf);
+              } catch (err) {
+                response.writeHead(500);
+                response.end();
+              }
+            })
+          );
+
+          try {
+            svc.processor.process(input, output);
+            transportWithData.commitPosition();
+          } catch (err) {
+            if (err instanceof InputBufferUnderrunError) {
+              transportWithData.rollbackPosition();
+            } else {
               response.writeHead(500);
               response.end();
             }
-          })
-        );
-
-        try {
-          svc.processor.process(input, output);
-          transportWithData.commitPosition();
-        } catch (err) {
-          if (err instanceof InputBufferUnderrunError) {
-            transportWithData.rollbackPosition();
-          } else {
-            response.writeHead(500);
-            response.end();
           }
-        }
-      })
-    );
+        }, 0)
+      );
+    }
   }
 
   //Handle GET methods (Static Page Server)
   ///////////////////////////////////////////////////
-  function processGet(request, response) {
+  function processGet(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): void {
     //Undefined or empty base directory means do not serve static files
     if (!baseDir || '' === baseDir) {
       response.writeHead(404);
@@ -437,7 +485,7 @@ exports.createWebServer = function(options) {
     //Verify CORS requirements
     if (!VerifyCORSAndSetHeaders(request, response)) {
       response.writeHead(
-        '403',
+        403,
         'Origin ' + request.headers.origin + ' not allowed',
         {}
       );
@@ -446,7 +494,7 @@ exports.createWebServer = function(options) {
     }
 
     //Locate the file requested and send it
-    const uri = url.parse(request.url).pathname;
+    const uri = url.parse(request.url || '').pathname || '';
     let filename = path.resolve(path.join(baseDir, uri));
 
     //Ensure the basedir path is not able to be escaped
@@ -473,7 +521,7 @@ exports.createWebServer = function(options) {
           response.end(err + '\n');
           return;
         }
-        const headers = {};
+        const headers: http.OutgoingHttpHeaders = {};
         const contentType = contentTypesByExtension[path.extname(filename)];
         if (contentType) {
           headers['Content-Type'] = contentType;
@@ -490,13 +538,18 @@ exports.createWebServer = function(options) {
 
   //Handle WebSocket calls (TWebSocketTransport)
   ///////////////////////////////////////////////////
-  function processWS(data, socket, svc, binEncoding) {
+  function processWS(
+    data: Buffer,
+    socket: TAbstractTransport,
+    svc: ServiceObject,
+    binEncoding: boolean
+  ): void {
     svc.transport.receiver(function(transportWithData) {
       const input = new svc.protocol(transportWithData);
       const output = new svc.protocol(
-        new svc.transport(undefined, function(buf) {
+        new svc.transport(undefined, function(buf: Buffer) {
           try {
-            const frame = wsFrame.encode(buf, null, binEncoding);
+            const frame = WSFrame.encode(buf, null, binEncoding);
             socket.write(frame);
           } catch (err) {
             //TODO: Add better error processing
@@ -514,7 +567,7 @@ exports.createWebServer = function(options) {
           //TODO: Add better error processing
         }
       }
-    })(data);
+    }, 0)(data);
   }
 
   //Create the server (HTTP or HTTPS)
@@ -530,7 +583,10 @@ exports.createWebServer = function(options) {
   //   - POST XHR Thrift services
   //   - OPTIONS CORS requests
   server
-    .on('request', function(request, response) {
+    .on('request', function(
+      request: http.IncomingMessage,
+      response: http.ServerResponse
+    ) {
       if (request.method === 'POST') {
         processPost(request, response);
       } else if (request.method === 'GET') {
@@ -542,9 +598,9 @@ exports.createWebServer = function(options) {
         response.end();
       }
     })
-    .on('upgrade', function(request, socket, head) {
+    .on('upgrade', function(request, socket) {
       //Lookup service
-      let svc;
+      let svc: ServiceObject;
       try {
         svc = services[Object.keys(services)[0]];
       } catch (e) {
@@ -574,11 +630,11 @@ exports.createWebServer = function(options) {
           '\r\n'
       );
       //Handle WebSocket traffic
-      let data = null;
-      socket.on('data', function(frame) {
+      let data: Buffer | null = null;
+      socket.on('data', function(frame: Buffer | null) {
         try {
           while (frame) {
-            const result = wsFrame.decode(frame);
+            const result = WSFrame.decode(frame);
             //Prepend any existing decoded data
             if (data) {
               if (result.data) {
@@ -593,7 +649,12 @@ exports.createWebServer = function(options) {
             }
             //If this completes a message process it
             if (result.FIN) {
-              processWS(result.data, socket, svc, result.binEncoding);
+              processWS(
+                result.data || Buffer.from(''),
+                socket,
+                svc,
+                result.binEncoding
+              );
             } else {
               data = result.data;
             }
@@ -609,4 +670,4 @@ exports.createWebServer = function(options) {
 
   //Return the server
   return server;
-};
+}
