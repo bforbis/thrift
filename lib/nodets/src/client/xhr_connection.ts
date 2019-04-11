@@ -37,7 +37,7 @@ import {
   TApplicationException,
   TApplicationExceptionType
 } from '../exception';
-import { default as createClient } from './create_client';
+import createClient from './create_client';
 
 /**
  * Constructor Function for the XHR Connection.
@@ -332,12 +332,12 @@ export class XHRConnection extends EventEmitter implements TConnection {
  * @returns {XHRConnection} The connection object.
  * @see {@link XHRConnectOptions}
  */
-exports.createXHRConnection = function(
+export function createXHRConnection(
   host: string,
   port: number,
   options?: XHRConnectOptions
-) {
+): XHRConnection {
   return new XHRConnection(host, port, options);
-};
+}
 
-exports.createXHRClient = createClient;
+export { createClient as createXHRClient };
